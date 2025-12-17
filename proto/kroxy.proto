@@ -1,0 +1,50 @@
+syntax = "proto3";
+package kroxy;
+
+import "google/protobuf/timestamp.proto";
+
+service KafkaProxy {
+  // Produce is method for producing messages to Kafka
+  rpc Produce(ProduceRequest) returns (ProduceResponse);
+  // Consume is method for streaming messages from Kafka.
+  rpc Consume(stream ConsumeRequest) returns (stream ConsumeResponse);
+}
+
+message ProduceRequest {
+  string topic = 1;
+  repeated string brokers = 2; // if empty, topic configuration will be looked up in kroxy config
+  Durability durability = 3;
+  repeated Message messages = 4; // messages can be batched
+}
+
+message ProduceResponse {
+}
+
+message ConsumeRequest {
+  string topic = 1; // all subsequent requests in same stream must use same topic
+  repeated string brokers = 2; // if empty, topic configuration will be looked up in kroxy config
+  string consumerGroup = 3;  // all subsequent requessts in same stream must use same consumer group
+  // ackPrevious message: if true, previous message in stream is committed.
+  // If false, previous message in stream is committed and message if forwarded to DLQ topic if it is configured for this topic
+  bool ackPreviousMessage = 4;  
+}
+
+message ConsumeResponse {
+  Message message = 1;
+  int32 partition = 2;
+  int64 offset = 3;
+  map<string, bytes> headers = 4;
+}
+  
+message Message {
+  bytes key = 1;
+  bytes value = 2;
+  google.protobuf.Timestamp timestamp = 3;
+  map<string, bytes> headers = 4;
+}
+
+enum Durability {
+  ALL = 0;  // wait ACK from each ISR member
+  ONE = 1;  // wait ACK from leader
+  NONE = 2; // do not wait for ACKs
+}
