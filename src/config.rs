@@ -1,11 +1,17 @@
-use std::fs;
+use std::{collections::HashMap, fs};
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct Config {
     pub bind_addr: String,
+    pub topics: HashMap<String, TopicConfig>,
+}
+
+#[derive(Clone, Deserialize)]
+pub struct TopicConfig {
+    pub brokers: Vec<String>,
 }
 
 impl Config {
