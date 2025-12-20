@@ -12,7 +12,7 @@ metrics = "0.24.3"
 metrics-exporter-prometheus = "0.18.1"
 prost = "0.14.1"
 prost-types = "0.14.1"
-rdkafka = "0.38.0"
+rdkafka = { version = "0.38.0", features = ["tracing"] }
 serde = { version = "1.0.228", features = ["derive"] }
 tokio = { version = "1.48.0", features = ["macros", "rt-multi-thread", "sync"] }
 tokio-stream = "0.1.17"

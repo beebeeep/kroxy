@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
-    sync::Mutex,
-    time::{SystemTime, UNIX_EPOCH},
+    sync::{Arc, Mutex},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, anyhow};
@@ -13,8 +13,12 @@ use rdkafka::{
     producer::{BaseRecord, ProducerContext, ThreadedProducer},
 };
 use tokio::sync::mpsc;
+use tracing::{debug, info};
 
-use crate::{config::Config, grpc};
+use crate::{config::Config, grpc, util::Tracker};
+
+const PRODUCER_TTL: Duration = Duration::from_secs(10);
+const CLEANUP_PERIOD: Duration = Duration::from_secs(5);
 
 type KafkaResult = Result<(), (usize, KafkaError)>;
 
@@ -41,15 +45,39 @@ impl ProducerContext for DeliveryHandler {
 
 pub(crate) struct Producer {
     cfg: Config,
-    connections: Mutex<HashMap<String, ThreadedProducer<DeliveryHandler>>>,
+    connections: Arc<Mutex<HashMap<String, Tracker<ThreadedProducer<DeliveryHandler>>>>>,
 }
 
 impl Producer {
     pub(crate) fn new(cfg: &Config) -> Self {
-        Self {
+        let connections = Arc::new(Mutex::new(HashMap::new()));
+        let producer = Self {
             cfg: cfg.clone(),
-            connections: Mutex::new(HashMap::new()), // TODO: implement idling connections cleanup
-        }
+            connections: connections.clone(),
+        };
+
+        tokio::spawn(async move {
+            // task for cleaning up idling producers
+            let mut to_remove = Vec::new();
+            loop {
+                {
+                    let mut conns = connections.lock().expect("poisoned lock");
+                    for (k, v) in conns.iter() {
+                        if v.is_expired() {
+                            to_remove.push(k.clone());
+                        }
+                    }
+                    for k in to_remove.iter() {
+                        debug!(topic = k, "deleting idle producer");
+                        conns.remove(k);
+                    }
+                    to_remove.truncate(0);
+                }
+                tokio::time::sleep(CLEANUP_PERIOD).await;
+            }
+        });
+
+        producer
     }
 
     pub(crate) async fn produce(
@@ -62,7 +90,7 @@ impl Producer {
             self.cfg
                 .topics
                 .get(topic)
-                .context("topic not configured and no brokers specified")?
+                .context("requested topic is not configured and no brokers specified")?
                 .brokers
                 .as_ref()
         } else {
@@ -71,15 +99,19 @@ impl Producer {
 
         let conn = {
             let mut conns = self.connections.lock().expect("poisoned lock");
-            match conns.get(topic) {
-                Some(p) => p.clone(),
+            // TODO: hash by topic+brokers
+            match conns.get_mut(topic) {
+                Some(t) => t.claim(),
                 None => {
                     let mut cfg = ClientConfig::new();
                     cfg.set("bootstrap.servers", brokers.join(","));
                     let producer =
                         ThreadedProducer::from_config_and_context(&cfg, DeliveryHandler {})
                             .context("connecting to kafka")?;
-                    conns.insert(String::from(topic), producer.clone());
+                    conns.insert(
+                        String::from(topic),
+                        Tracker::new(producer.clone(), PRODUCER_TTL),
+                    );
                     producer
                 }
             }
@@ -107,6 +139,11 @@ impl Producer {
         // send whole batch
         // NB: librdkafka does own buffering. This means that our batch may be split between multiple internal batches.
         // TODO: configure librdkafka buffering
+        debug!(
+            count = messages.len(),
+            topic = topic,
+            "producing batch of messages"
+        );
         for (i, msg) in messages.iter().enumerate() {
             let record = BaseRecord {
                 topic,
