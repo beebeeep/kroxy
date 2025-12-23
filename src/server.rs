@@ -1,8 +1,10 @@
 use std::pin::Pin;
 
 use anyhow::Result;
-use tokio_stream::Stream;
+use tokio::sync::mpsc;
+use tokio_stream::{Stream, StreamExt, wrappers::ReceiverStream};
 use tonic::{Request, Response, Status, Streaming};
+use tracing::error;
 
 use crate::{
     config::Config,
@@ -45,8 +47,27 @@ impl grpc::kafka_proxy_server::KafkaProxy for Server {
     }
     async fn consume(
         &self,
-        _req: Request<Streaming<ConsumeRequest>>,
+        req: Request<Streaming<ConsumeRequest>>,
     ) -> Result<Response<Self::ConsumeStream>, Status> {
-        unimplemented!()
+        let mut in_stream = req.into_inner();
+        let (tx, rx) = mpsc::channel(16);
+
+        tokio::spawn(async move {
+            while let Some(v) = in_stream.next().await {
+                match v {
+                    Ok(req) => {
+                        println!("topic {} ack {}", req.topic, req.ack_previous_message);
+                    }
+                    Err(e) => {
+                        error!(error = format!("{:?}", e), "stream error");
+                        // close consumer here
+                        break;
+                    }
+                }
+            }
+        });
+
+        let out_stream = ReceiverStream::new(rx);
+        Ok(Response::new(Box::pin(out_stream) as Self::ConsumeStream))
     }
 }
