@@ -1,14 +1,19 @@
-use std::pin::Pin;
+use std::{
+    collections::HashMap,
+    pin::Pin,
+    time::{Duration, SystemTime},
+};
 
 use anyhow::Result;
+use prost_types::Timestamp;
 use tokio::sync::mpsc;
 use tokio_stream::{Stream, StreamExt, wrappers::ReceiverStream};
 use tonic::{Request, Response, Status, Streaming};
-use tracing::error;
+use tracing::{error, warn};
 
 use crate::{
     config::Config,
-    grpc::{self, ConsumeRequest, ConsumeResponse, ProduceRequest, ProduceResponse},
+    grpc::{self, ConsumeRequest, ConsumeResponse, Message, ProduceRequest, ProduceResponse},
     producer::Producer,
 };
 
@@ -57,6 +62,26 @@ impl grpc::kafka_proxy_server::KafkaProxy for Server {
                 match v {
                     Ok(req) => {
                         println!("topic {} ack {}", req.topic, req.ack_previous_message);
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        let next_msg = ConsumeResponse {
+                            message: Some(Message {
+                                key: Vec::new(),
+                                value: "CHLOS".into(),
+                                timestamp: Some(Timestamp::from(SystemTime::now())),
+                                headers: HashMap::new(),
+                            }),
+                            partition: 0,
+                            offset: 0,
+                        };
+                        match tx.send(Ok(next_msg)).await {
+                            Ok(_) => {
+                                // ok
+                            }
+                            Err(e) => {
+                                warn!("stream closed: {e:?}");
+                                return;
+                            }
+                        };
                     }
                     Err(e) => {
                         error!(error = format!("{:?}", e), "stream error");

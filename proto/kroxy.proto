@@ -33,7 +33,6 @@ message ConsumeResponse {
   Message message = 1;
   int32 partition = 2;
   int64 offset = 3;
-  map<string, bytes> headers = 4;
 }
   
 message Message {

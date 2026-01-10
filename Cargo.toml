@@ -24,3 +24,6 @@ tracing-subscriber = { version = "0.3.22", features = ["json", "env-filter", "fm
 
 [build-dependencies]
 tonic-prost-build = "0.14.2"
+
+[[example]]
+name = "client"
