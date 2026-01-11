@@ -24,11 +24,12 @@ type KafkaResult = Result<(), (usize, KafkaError)>;
 
 // DeliveryHandler implements rdkafka::producer::ProducerContext
 // delivery() callback sends result of message producing to channel provided by delivery_opaque field in BaseRecord
-struct DeliveryHandler {}
+struct DeliveryHandler;
 
 impl ClientContext for DeliveryHandler {}
 impl ProducerContext for DeliveryHandler {
     type DeliveryOpaque = Box<(usize, mpsc::Sender<KafkaResult>)>;
+
     fn delivery(
         &self,
         delivery_result: &DeliveryResult<'_>,
@@ -43,17 +44,19 @@ impl ProducerContext for DeliveryHandler {
     }
 }
 
+// Producer wraps all the logic required for producing messages to Kafka.
+// It automatically opens connections to configured/requested Kafkas; connections are closed after period of inactivity.
 pub(crate) struct Producer {
     cfg: Config,
-    connections: Arc<Mutex<HashMap<String, Tracker<ThreadedProducer<DeliveryHandler>>>>>,
+    producers: Arc<Mutex<HashMap<String, Tracker<ThreadedProducer<DeliveryHandler>>>>>,
 }
 
 impl Producer {
     pub(crate) fn new(cfg: &Config) -> Self {
-        let connections = Arc::new(Mutex::new(HashMap::new()));
+        let producers = Arc::new(Mutex::new(HashMap::new()));
         let producer = Self {
             cfg: cfg.clone(),
-            connections: connections.clone(),
+            producers: producers.clone(),
         };
 
         tokio::spawn(async move {
@@ -61,7 +64,7 @@ impl Producer {
             let mut to_remove = Vec::new();
             loop {
                 {
-                    let mut conns = connections.lock().expect("poisoned lock");
+                    let mut conns = producers.lock().expect("poisoned lock");
                     for (k, v) in conns.iter() {
                         if v.is_expired() {
                             to_remove.push(k.clone());
@@ -80,11 +83,13 @@ impl Producer {
         producer
     }
 
+    // produce resolves after requested number of broker(s) acknowledged write
     pub(crate) async fn produce(
         &self,
         topic: &str,
         brokers: &[String],
         messages: &[grpc::Message],
+        durability: &grpc::Durability,
     ) -> Result<()> {
         let brokers = if brokers.is_empty() {
             self.cfg
@@ -97,18 +102,18 @@ impl Producer {
             brokers
         };
 
-        let conn = {
-            let mut conns = self.connections.lock().expect("poisoned lock");
-            // TODO: hash by topic+brokers
-            match conns.get_mut(topic) {
-                Some(t) => t.claim(),
+        let producer = {
+            let mut producers = self.producers.lock().expect("poisoned lock");
+            // TODO: hash by topic+brokers+durability
+            match producers.get_mut(topic) {
+                Some(p) => p.claim(),
                 None => {
                     let mut cfg = ClientConfig::new();
                     cfg.set("bootstrap.servers", brokers.join(","));
                     let producer =
                         ThreadedProducer::from_config_and_context(&cfg, DeliveryHandler {})
                             .context("connecting to kafka")?;
-                    conns.insert(
+                    producers.insert(
                         String::from(topic),
                         Tracker::new(producer.clone(), PRODUCER_TTL),
                     );
@@ -164,7 +169,7 @@ impl Producer {
                 delivery_opaque: Box::new((i, sender.clone())),
             };
 
-            if let Err(e) = conn.send(record) {
+            if let Err(e) = producer.send(record) {
                 let _ = sender.send(Err((i, e.0))).await;
             }
         }

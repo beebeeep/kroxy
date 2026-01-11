@@ -43,13 +43,14 @@ impl grpc::kafka_proxy_server::KafkaProxy for Server {
         let req = req.into_inner();
         match self
             .producer
-            .produce(&req.topic, &req.brokers, &req.messages)
+            .produce(&req.topic, &req.brokers, &req.messages, &req.durability())
             .await
         {
             Ok(_) => Ok(Response::from(ProduceResponse {})),
             Err(e) => Err(Status::internal(e.to_string())),
         }
     }
+
     async fn consume(
         &self,
         req: Request<Streaming<ConsumeRequest>>,
