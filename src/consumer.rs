@@ -1,6 +1,5 @@
 use std::{
     collections::HashMap,
-    io::Read,
     sync::{Arc, Mutex},
     time::Instant,
 };
@@ -10,20 +9,23 @@ use crate::{
     grpc,
     util::Tracker,
 };
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result};
 use rdkafka::{
     ClientConfig, ClientContext, Message, TopicPartitionList,
     config::{FromClientConfigAndContext, RDKafkaLogLevel},
     consumer::{BaseConsumer, ConsumerContext, Rebalance, StreamConsumer},
     error::KafkaResult,
-    message::{BorrowedMessage, OwnedMessage},
+    message::{BorrowedMessage, Headers},
 };
 use tokio::{
     select,
     sync::{mpsc, oneshot},
-    task::{AbortHandle, JoinHandle},
+    task::AbortHandle,
+    time,
 };
 use tracing::{error, info};
+
+const DISPATCHER_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_millis(300);
 
 pub(crate) struct ConsumersManager {
     cfg: Config,
@@ -58,10 +60,17 @@ impl Consumer {
             None => &ConsumerConfig::default(),
             Some(c) => c,
         };
+        let (acks_tx, acks_rx) = mpsc::channel(16);
+        let (releases_tx, releases_rx) = mpsc::channel(16);
+        let (claims_tx, claims_rx) = mpsc::channel(16);
         let c = ConsumerInner {
             consumer,
             message_buffer: Vec::with_capacity(group_cfg.buffer_size),
-            meta_buffer: Vec::with_capacity(group_cfg.buffer_size),
+            next_message: None,
+            cfg: group_cfg.clone(),
+            msg_acks: acks_rx,
+            msg_releases: releases_rx,
+            msg_claims: claims_rx,
         };
         let handler = tokio::spawn(c.run()).abort_handle();
 
@@ -71,42 +80,111 @@ impl Consumer {
     }
 }
 
-struct ConsumerInner<'a> {
+struct ConsumerInner {
     cfg: ConsumerConfig,
     consumer: StreamConsumer<CustomContext>,
-    message_buffer: Vec<BorrowedMessage<'a>>,
-    meta_buffer: Vec<MessageMeta>, // XXXXXXXXXXXXXXXXXX mb wrap BorrowedMessage with metadata?
+    message_buffer: Vec<MessageWithMeta>,
+    next_message: Option<(grpc::Message, usize)>,
 
     msg_acks: mpsc::Receiver<usize>, // channel for ACKing message in buffers indexed by value
-    msg_release: mpsc::Receiver<usize>, // channel for releasing claimed messages
+    msg_releases: mpsc::Receiver<usize>, // channel for releasing claimed messages
     msg_claims: mpsc::Receiver<oneshot::Sender<grpc::Message>>, // channel for requesting message claims
 }
 
-impl<'a> ConsumerInner<'a> {
+impl ConsumerInner {
     async fn run(mut self) {
         loop {
-            select! {
-                msg = self.consumer.recv(), if self.message_buffer.len() < self.cfg.buffer_size => {
-                    //new message from kafka, add to batch
-                    // NB: consumer.recv() is supposed to be cancellation-safe
-                    match msg {
-                        Err(e) => {
-                            error!("consuming message from kafka: {e}");
-                        },
-                        Ok(msg) => {
-                            self.message_buffer.push(msg);
-                            self.meta_buffer.push(MessageMeta { acked: false, claimed_at: None });
-                        }
-                    };
-                }
+            self.get_next_message();
+            self.process_events().await;
+            self.commit_if_needed();
+        }
+    }
+
+    async fn process_events(&mut self) {
+        select! {
+            msg = self.consumer.recv(), if self.message_buffer.len() < self.cfg.buffer_size => {
+                //new message from kafka, add to batch
+                // NB: consumer.recv() is supposed to be cancellation-safe
+                match msg {
+                    Err(e) => {
+                        error!("consuming message from kafka: {e}");
+                    },
+                    Ok(msg) => {
+                        self.message_buffer.push(MessageWithMeta::from(msg));
+                    }
+                };
+            }
+            Some(out_msg) = self.msg_claims.recv(), if self.next_message.is_some() => {
+                let (msg, idx) = self.next_message.take().unwrap();
+                self.message_buffer[idx].claimed_at = Some(Instant::now());
+                let _ = out_msg.send(msg);
+            }
+            Some(idx) = self.msg_acks.recv() => {
+                self.message_buffer[idx].acked = true;
+            }
+            Some(idx) = self.msg_releases.recv() => {
+                self.message_buffer[idx].claimed_at = None;
+            }
+            _ = time::sleep(DISPATCHER_TIMEOUT) => {
+                // periodically check for new messages, some may have timed out claims
+            }
+        };
+    }
+
+    // get_new_message find next unclaimed message and returns its copy
+    fn get_next_message(&mut self) {
+        if self.next_message.is_some() {
+            return;
+        }
+        for (idx, msg) in self.message_buffer.iter().enumerate() {
+            if !msg.acked && msg.claimed_at.is_none() {
+                self.next_message = Some((msg.inner.clone(), idx));
             }
         }
+        self.next_message = None
+    }
+
+    fn commit_if_needed(&mut self) {
+        todo!();
     }
 }
 
-struct MessageMeta {
+struct MessageWithMeta {
+    inner: grpc::Message,
     acked: bool,
     claimed_at: Option<Instant>,
+}
+
+impl From<BorrowedMessage<'_>> for MessageWithMeta {
+    fn from(msg: BorrowedMessage) -> Self {
+        Self {
+            inner: grpc::Message {
+                key: msg.key().map_or_else(Vec::new, |v| v.to_vec()),
+                value: msg.payload().map_or_else(Vec::new, |v| v.to_vec()),
+                timestamp: match msg.timestamp() {
+                    rdkafka::Timestamp::NotAvailable => None,
+                    rdkafka::Timestamp::CreateTime(ts) => Some(prost_types::Timestamp {
+                        seconds: ts,
+                        nanos: 0,
+                    }),
+                    rdkafka::Timestamp::LogAppendTime(ts) => Some(prost_types::Timestamp {
+                        seconds: ts,
+                        nanos: 0,
+                    }),
+                },
+                headers: msg.headers().map_or_else(HashMap::new, |v| {
+                    HashMap::from_iter(v.iter().map(|h| {
+                        (
+                            h.key.to_string(),
+                            h.value.map_or_else(Vec::new, |v| v.to_vec()),
+                        )
+                    }))
+                }),
+            },
+            acked: false,
+            claimed_at: None,
+        }
+    }
 }
 
 struct CustomContext;
