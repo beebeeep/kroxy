@@ -13,6 +13,7 @@ use tracing::{error, warn};
 
 use crate::{
     config::Config,
+    consumer::ConsumersManager,
     grpc::{self, ConsumeRequest, ConsumeResponse, Message, ProduceRequest, ProduceResponse},
     producer::Producer,
 };
@@ -20,6 +21,7 @@ use crate::{
 pub struct Server {
     cfg: Config,
     producer: Producer,
+    consumers_manager: ConsumersManager,
 }
 
 impl Server {
@@ -27,6 +29,7 @@ impl Server {
         Self {
             cfg: cfg.clone(),
             producer: Producer::new(cfg),
+            consumers_manager: ConsumersManager::new(cfg),
         }
     }
 }
@@ -60,6 +63,7 @@ impl grpc::kafka_proxy_server::KafkaProxy for Server {
 
         tokio::spawn(async move {
             while let Some(v) = in_stream.next().await {
+                // TODO: BatchedConsumer here and use it
                 match v {
                     Ok(req) => {
                         println!("topic {} ack {}", req.topic, req.ack_previous_message);
