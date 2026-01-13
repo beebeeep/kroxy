@@ -1,25 +1,25 @@
-use std::time::{Duration, Instant};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
-pub(crate) struct Tracker<T: Clone> {
-    inner: T,
+pub(crate) struct Tracker<T> {
+    inner: Arc<T>,
     ttl: Duration,
     expire: Instant,
-    users: u32,
 }
 
-impl<T: Clone> Tracker<T> {
+impl<T> Tracker<T> {
     pub(crate) fn new(t: T, ttl: Duration) -> Self {
         Self {
-            inner: t,
+            inner: Arc::new(t),
             ttl,
             expire: Instant::now().checked_add(ttl).expect("wrong ttl"),
-            users: 0,
         }
     }
 
-    pub(crate) fn claim(&mut self) -> T {
+    pub(crate) fn claim(&mut self) -> Arc<T> {
         self.expire = Instant::now().checked_add(self.ttl).expect("wrong ttl");
-        self.users += 1;
         self.inner.clone()
     }
 
@@ -27,15 +27,11 @@ impl<T: Clone> Tracker<T> {
         self.expire = Instant::now().checked_add(self.ttl).expect("wrong ttl");
     }
 
-    pub(crate) fn release(&mut self) {
-        self.users = self.users.saturating_sub(1);
-    }
-
     pub(crate) fn is_expired(&self) -> bool {
         Instant::now() > self.expire
     }
 
     pub(crate) fn is_used(&self) -> bool {
-        self.users > 0
+        Arc::strong_count(&self.inner) > 1
     }
 }

@@ -2,7 +2,6 @@ use std::collections::HashMap;
 
 use clap::{Parser, command};
 use kroxy::grpc;
-use rdkafka::bindings::rd_kafka_MemberDescription_group_instance_id;
 use tokio::{
     io::{self, AsyncBufReadExt},
     sync::mpsc,

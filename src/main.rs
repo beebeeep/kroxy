@@ -24,7 +24,7 @@ struct Args {
 async fn main() -> Result<()> {
     let args = Args::parse();
     let layer = tracing_subscriber::fmt::layer().json().flatten_event(true);
-    let filter = EnvFilter::builder().parse(format!("{0},kroxy={0}", args.log_level))?;
+    let filter = EnvFilter::builder().parse(format!("{0},kroxy={0},h2=info", args.log_level))?;
     let subscriber = tracing_subscriber::registry().with(layer).with(filter);
     if let Some(f) = args.log_file {
         let file = OpenOptions::new()
@@ -50,7 +50,7 @@ async fn main() -> Result<()> {
 
     _ = tokio::spawn(async move {
         let srv = Server::builder().add_service(KafkaProxyServer::new(kroxy_server));
-        srv.serve(bind_addr).await
+        srv.serve(bind_addr).await.expect("running server");
     })
     .await?;
 

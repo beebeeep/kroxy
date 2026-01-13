@@ -17,10 +17,14 @@ pub struct TopicConfig {
 
 #[derive(Clone, Deserialize)]
 pub struct ConsumerConfig {
+    #[serde(default = "default_buffer_size")]
     pub buffer_size: usize,
+    #[serde(default = "default_min_bytes")]
     pub min_bytes: usize,
+    #[serde(default = "default_max_bytes")]
     pub max_bytes: usize,
-    pub message_timeout: Duration,
+    #[serde(default = "default_timeout")]
+    pub message_timeout_ms: u64,
 }
 
 impl Config {
@@ -34,10 +38,23 @@ impl Config {
 impl Default for ConsumerConfig {
     fn default() -> Self {
         Self {
-            buffer_size: 100,
-            min_bytes: 1,
-            max_bytes: 50 * 1024 * 1024,
-            message_timeout: Duration::from_secs(30),
+            buffer_size: default_buffer_size(),
+            min_bytes: default_min_bytes(),
+            max_bytes: default_max_bytes(),
+            message_timeout_ms: default_timeout(),
         }
     }
+}
+
+fn default_min_bytes() -> usize {
+    1
+}
+fn default_max_bytes() -> usize {
+    50 * 1024 * 1024
+}
+fn default_timeout() -> u64 {
+    10000
+}
+fn default_buffer_size() -> usize {
+    100
 }

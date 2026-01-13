@@ -1,25 +1,19 @@
-use std::{
-    collections::HashMap,
-    pin::Pin,
-    time::{Duration, SystemTime},
-};
+use std::{pin::Pin, sync::Arc};
 
 use anyhow::Result;
-use prost_types::Timestamp;
 use tokio::sync::mpsc;
 use tokio_stream::{Stream, StreamExt, wrappers::ReceiverStream};
 use tonic::{Request, Response, Status, Streaming};
-use tracing::{error, warn};
+use tracing::{debug, error};
 
 use crate::{
     config::Config,
-    consumer::ConsumersManager,
-    grpc::{self, ConsumeRequest, ConsumeResponse, Message, ProduceRequest, ProduceResponse},
+    consumer::{BatchedConsumer, ConsumersManager},
+    grpc::{self, ConsumeRequest, ConsumeResponse, ProduceRequest, ProduceResponse},
     producer::Producer,
 };
 
 pub struct Server {
-    cfg: Config,
     producer: Producer,
     consumers_manager: ConsumersManager,
 }
@@ -27,9 +21,92 @@ pub struct Server {
 impl Server {
     pub fn new(cfg: &Config) -> Self {
         Self {
-            cfg: cfg.clone(),
             producer: Producer::new(cfg),
             consumers_manager: ConsumersManager::new(cfg),
+        }
+    }
+
+    async fn consumer_stream_handler(
+        mut req_stream: Streaming<ConsumeRequest>,
+        response: mpsc::Sender<Result<ConsumeResponse, Status>>,
+        consumers_manager: ConsumersManager,
+    ) {
+        let mut stream_consumer: Option<Arc<BatchedConsumer>> = None;
+        let mut last_message_id: Option<usize> = None;
+
+        while let Some(req) = req_stream.next().await {
+            let req = match req {
+                Err(e) => {
+                    error!(error = format!("{}", e), "stream error");
+                    if let (Some(id), Some(consumer)) = (last_message_id, stream_consumer) {
+                        let _ = consumer.release_message(id).await;
+                    }
+                    return;
+                }
+                Ok(req) => req,
+            };
+
+            debug!(
+                topic = req.topic,
+                ack = req.ack_previous_message,
+                "got streaming request"
+            );
+
+            if stream_consumer.is_none() {
+                stream_consumer = match consumers_manager.get_consumer(
+                    &req.topic,
+                    &req.brokers,
+                    &req.consumer_group,
+                ) {
+                    Ok(c) => Some(c),
+                    Err(e) => {
+                        let _ = response
+                            .send(Err(Status::internal(format!(
+                                "failed to create kafka consumer: {e}"
+                            ))))
+                            .await;
+                        return;
+                    }
+                };
+            };
+            let consumer = stream_consumer.as_ref().unwrap();
+
+            if let Some(id) = last_message_id {
+                if req.ack_previous_message {
+                    if let Err(e) = consumer.ack_message(id).await {
+                        let _ = response
+                            .send(Err(Status::internal(format!("ACKing message: {e}"))))
+                            .await;
+                        return;
+                    }
+                } else {
+                    if let Err(e) = consumer.release_message(id).await {
+                        let _ = response
+                            .send(Err(Status::internal(format!("NACKing message: {e}"))))
+                            .await;
+                        return;
+                    }
+                    // TODO: send to DLQ
+                }
+            }
+
+            let msg = match consumer.claim_message().await {
+                Ok(msg) => msg,
+                Err(e) => {
+                    let _ = response
+                        .send(Err(Status::internal(format!("getting next message: {e}"))))
+                        .await;
+                    return;
+                }
+            };
+            last_message_id = Some(msg.id);
+            let _ = response
+                .send(Ok(ConsumeResponse {
+                    message: Some(msg.inner),
+                    partition: msg.partition,
+                    offset: msg.offset,
+                }))
+                .await;
         }
     }
 }
@@ -58,44 +135,14 @@ impl grpc::kafka_proxy_server::KafkaProxy for Server {
         &self,
         req: Request<Streaming<ConsumeRequest>>,
     ) -> Result<Response<Self::ConsumeStream>, Status> {
-        let mut in_stream = req.into_inner();
+        let in_stream = req.into_inner();
         let (tx, rx) = mpsc::channel(16);
 
-        tokio::spawn(async move {
-            while let Some(v) = in_stream.next().await {
-                // TODO: BatchedConsumer here and use it
-                match v {
-                    Ok(req) => {
-                        println!("topic {} ack {}", req.topic, req.ack_previous_message);
-                        tokio::time::sleep(Duration::from_millis(100)).await;
-                        let next_msg = ConsumeResponse {
-                            message: Some(Message {
-                                key: Vec::new(),
-                                value: "CHLOS".into(),
-                                timestamp: Some(Timestamp::from(SystemTime::now())),
-                                headers: HashMap::new(),
-                            }),
-                            partition: 0,
-                            offset: 0,
-                        };
-                        match tx.send(Ok(next_msg)).await {
-                            Ok(_) => {
-                                // ok
-                            }
-                            Err(e) => {
-                                warn!("stream closed: {e:?}");
-                                return;
-                            }
-                        };
-                    }
-                    Err(e) => {
-                        error!(error = format!("{:?}", e), "stream error");
-                        // close consumer here
-                        break;
-                    }
-                }
-            }
-        });
+        tokio::spawn(Server::consumer_stream_handler(
+            in_stream,
+            tx,
+            self.consumers_manager.clone(),
+        ));
 
         let out_stream = ReceiverStream::new(rx);
         Ok(Response::new(Box::pin(out_stream) as Self::ConsumeStream))

@@ -1,3 +1,6 @@
 bind_addr = "0.0.0.0:50051"
 [topics.test-topic]
 brokers = ["localhost:9092"]
+[topics.test-topic.consumers.kroxy-example]
+buffer_size = 5
+

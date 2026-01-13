@@ -1,11 +1,11 @@
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use crate::{
-    config::{Config, ConsumerConfig, TopicConfig},
+    config::{Config, ConsumerConfig},
     grpc,
     util::Tracker,
 };
@@ -21,29 +21,92 @@ use tokio::{
     select,
     sync::{mpsc, oneshot},
     task::AbortHandle,
-    time,
 };
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 const DISPATCHER_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_millis(300);
+const CONSUMER_TTL: Duration = Duration::from_secs(5);
+const CLEANUP_PERIOD: Duration = Duration::from_secs(5);
 
+#[derive(Clone)]
 pub(crate) struct ConsumersManager {
     cfg: Config,
     consumers: Arc<Mutex<HashMap<String, Tracker<BatchedConsumer>>>>,
 }
 impl ConsumersManager {
     pub(crate) fn new(cfg: &Config) -> Self {
-        todo!()
+        let consumers = Arc::new(Mutex::new(HashMap::new()));
+        let manager = Self {
+            cfg: cfg.clone(),
+            consumers: consumers.clone(),
+        };
+
+        info!("starting consumer manager");
+        tokio::spawn(async move {
+            let mut to_remove = Vec::with_capacity(1);
+            loop {
+                {
+                    let mut cons = consumers.lock().expect("poisoned lock");
+                    for (k, v) in cons.iter() {
+                        if !v.is_used() && v.is_expired() {
+                            to_remove.push(k.clone());
+                        }
+                    }
+                    for k in to_remove.iter() {
+                        debug!(topic = k, "deleting unused idle consumer");
+                        cons.remove(k);
+                    }
+                }
+                to_remove.truncate(0);
+                tokio::time::sleep(CLEANUP_PERIOD).await;
+            }
+        });
+        manager
     }
 
-    fn get_consumer(&self, topic: &str, consumer_group: &str) -> Result<BatchedConsumer> {
-        todo!()
+    pub(crate) fn get_consumer(
+        &self,
+        topic: &str,
+        brokers: &[String],
+        consumer_group: &str,
+    ) -> Result<Arc<BatchedConsumer>> {
+        let consumer_id = format!("{topic}@{consumer_group}");
+        let brokers = if brokers.is_empty() {
+            self.cfg
+                .topics
+                .get(topic)
+                .context("requested topic is not configured and no brokers specified")?
+                .brokers
+                .as_ref()
+        } else {
+            brokers
+        };
+        let consumer = {
+            let mut consumers = self.consumers.lock().expect("poisoned lock");
+            match consumers.get_mut(&consumer_id) {
+                Some(c) => c.claim(),
+                None => {
+                    let group_cfg = self
+                        .cfg
+                        .topics
+                        .get(topic)
+                        .and_then(|c| c.consumers.get(consumer_group))
+                        .map_or_else(ConsumerConfig::default, |v| v.clone());
+                    let consumer = BatchedConsumer::new(topic, consumer_group, brokers, group_cfg)
+                        .context("creating consumer")?;
+                    consumers.insert(consumer_id.clone(), Tracker::new(consumer, CONSUMER_TTL));
+                    consumers.get_mut(&consumer_id).unwrap().claim()
+                }
+            }
+        };
+
+        Ok(consumer)
     }
 }
 
 #[derive(Clone)]
 pub(crate) struct BatchedConsumer {
-    stop_dispatcher: AbortHandle,
+    dispatcher_handle: AbortHandle,
     claims: mpsc::Sender<oneshot::Sender<MessageWithMeta>>,
     acks: mpsc::Sender<usize>,
     releases: mpsc::Sender<usize>,
@@ -54,16 +117,18 @@ impl BatchedConsumer {
         topic: &str,
         consumer_group: &str,
         brokers: &[String],
-        cfg: &TopicConfig,
+        cfg: ConsumerConfig,
     ) -> Result<Self> {
         let mut consumer_cfg = ClientConfig::new();
         consumer_cfg
             .set("group.id", consumer_group)
             .set("bootstrap.servers", brokers.join(","))
             .set("session.timeout.ms", "5000")
+            .set("enable.partition.eof", "false")
             .set("enable.auto.commit", "false")
             // .set("queued.max.messages.kbytes ", todo!()) // TODO: guess this defines how many BorrowedMessages we can store at the same time?
             .set_log_level(RDKafkaLogLevel::Debug);
+        info!(config = format!("{:?}", consumer_cfg), "consumer");
         let (commit_cb_tx, commit_cb_rx) = mpsc::channel(1);
         let consumer: StreamConsumer<CustomContext> = StreamConsumer::from_config_and_context(
             &consumer_cfg,
@@ -72,29 +137,28 @@ impl BatchedConsumer {
             },
         )
         .context("creating new consumer")?;
-        let group_cfg = match cfg.consumers.get(topic) {
-            None => &ConsumerConfig::default(),
-            Some(c) => c,
-        };
         let (acks_tx, acks_rx) = mpsc::channel(16);
         let (releases_tx, releases_rx) = mpsc::channel(16);
         let (claims_tx, claims_rx) = mpsc::channel(16);
-        let c = ConsumerDispatcher {
+        consumer
+            .subscribe(&[topic])
+            .context("subscribing to topic")?;
+        let dispatcher = ConsumerDispatcher {
             consumer,
             topic: topic.to_string(),
-            message_buffer: Vec::with_capacity(group_cfg.buffer_size),
+            message_buffer: Vec::with_capacity(cfg.buffer_size),
             acks: 0,
             next_message: None,
-            cfg: group_cfg.clone(),
+            cfg: cfg,
             msg_acks: acks_rx,
             msg_releases: releases_rx,
             msg_claims: claims_rx,
             commit_cb: commit_cb_rx,
         };
-        let handler = tokio::spawn(c.run()).abort_handle();
+        let handle = tokio::spawn(dispatcher.run()).abort_handle();
 
         Ok(Self {
-            stop_dispatcher: handler,
+            dispatcher_handle: handle,
             claims: claims_tx,
             acks: acks_tx,
             releases: releases_tx,
@@ -117,6 +181,12 @@ impl BatchedConsumer {
     }
 }
 
+impl Drop for BatchedConsumer {
+    fn drop(&mut self) {
+        self.dispatcher_handle.abort();
+    }
+}
+
 struct ConsumerDispatcher {
     cfg: ConsumerConfig,
     topic: String,
@@ -133,6 +203,7 @@ struct ConsumerDispatcher {
 
 impl ConsumerDispatcher {
     async fn run(mut self) {
+        debug!(topic = self.topic, "starting consumer dispatcher");
         loop {
             self.find_next_message();
             self.process_events().await;
@@ -143,6 +214,7 @@ impl ConsumerDispatcher {
     async fn process_events(&mut self) {
         select! {
             msg = self.consumer.recv(), if self.message_buffer.len() < self.cfg.buffer_size => {
+                debug!("got message");
                 //new message from kafka, add to batch
                 // NB: consumer.recv() is supposed to be cancellation-safe
                 // NB: this implementation seem to be less efficient that it could have been:
@@ -163,18 +235,22 @@ impl ConsumerDispatcher {
                 };
             }
             Some(out_msg) = self.msg_claims.recv(), if self.next_message.is_some() => {
+                debug!("sent message");
                 let msg = self.next_message.take().unwrap();
-                self.message_buffer[msg.id].claimed_at = Some(Instant::now());
+                self.message_buffer[msg.id].claim_expire = Some(Instant::now().checked_add(Duration::from_millis(self.cfg.message_timeout_ms)).unwrap());
                 let _ = out_msg.send(msg);
             }
             Some(idx) = self.msg_acks.recv() => {
+                debug!("ack");
                 self.acks += 1;
                 self.message_buffer[idx].acked = true;
             }
             Some(idx) = self.msg_releases.recv() => {
-                self.message_buffer[idx].claimed_at = None;
+                debug!("release");
+                self.message_buffer[idx].claim_expire = None;
             }
-            _ = time::sleep(DISPATCHER_TIMEOUT) => {
+            _ = tokio::time::sleep(DISPATCHER_TIMEOUT) => {
+                debug!("timeout!");
                 // periodically check for new messages, some may have timed out claims
             }
         };
@@ -186,7 +262,7 @@ impl ConsumerDispatcher {
             return;
         }
         for msg in &self.message_buffer {
-            if !msg.acked && msg.claimed_at.map_or(true, |v| v < Instant::now()) {
+            if !msg.acked && msg.claim_expire.map_or(true, |v| v < Instant::now()) {
                 self.next_message = Some(msg.clone());
             }
         }
@@ -195,7 +271,7 @@ impl ConsumerDispatcher {
 
     async fn commit_if_needed(&mut self) {
         // TODO: partial commit on exit
-        if self.acks < self.message_buffer.len() {
+        if self.acks == 0 || self.acks < self.message_buffer.len() {
             return;
         }
 
@@ -215,12 +291,19 @@ impl ConsumerDispatcher {
                 }
             }
         }
+
         let tpl = TopicPartitionList::from_topic_map(&HashMap::from_iter(
             tpl.into_iter()
                 .map(|(partition, offset)| ((self.topic.clone(), partition), offset)),
         ))
         .expect("generated incorrect TopicParititionList");
 
+        if tpl.count() == 0 {
+            // just in case, committing empty TPL never succeeds
+            return;
+        }
+
+        debug!(partition_count = tpl.count(), "committing offsets");
         if let Err(e) = self
             .consumer
             .commit(&tpl, rdkafka::consumer::CommitMode::Async)
@@ -250,7 +333,7 @@ pub(crate) struct MessageWithMeta {
     pub(crate) id: usize,
 
     acked: bool,
-    claimed_at: Option<Instant>,
+    claim_expire: Option<Instant>,
 }
 
 impl MessageWithMeta {
@@ -283,7 +366,7 @@ impl MessageWithMeta {
             partition: msg.partition(),
             offset: msg.offset(),
             acked: false,
-            claimed_at: None,
+            claim_expire: None,
         }
     }
 }

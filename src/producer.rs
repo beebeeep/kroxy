@@ -13,7 +13,7 @@ use rdkafka::{
     producer::{BaseRecord, ProducerContext, ThreadedProducer},
 };
 use tokio::sync::mpsc;
-use tracing::{debug, info};
+use tracing::debug;
 
 use crate::{config::Config, grpc, util::Tracker};
 
@@ -66,7 +66,7 @@ impl Producer {
                 {
                     let mut conns = producers.lock().expect("poisoned lock");
                     for (k, v) in conns.iter() {
-                        if v.is_expired() {
+                        if !v.is_used() && v.is_expired() {
                             to_remove.push(k.clone());
                         }
                     }
@@ -74,8 +74,8 @@ impl Producer {
                         debug!(topic = k, "deleting idle producer");
                         conns.remove(k);
                     }
-                    to_remove.truncate(0);
                 }
+                to_remove.truncate(0);
                 tokio::time::sleep(CLEANUP_PERIOD).await;
             }
         });
@@ -113,11 +113,8 @@ impl Producer {
                     let producer =
                         ThreadedProducer::from_config_and_context(&cfg, DeliveryHandler {})
                             .context("connecting to kafka")?;
-                    producers.insert(
-                        String::from(topic),
-                        Tracker::new(producer.clone(), PRODUCER_TTL),
-                    );
-                    producer
+                    producers.insert(String::from(topic), Tracker::new(producer, PRODUCER_TTL));
+                    producers.get_mut(topic).unwrap().claim()
                 }
             }
         };
