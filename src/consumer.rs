@@ -123,20 +123,17 @@ impl BatchedConsumer {
         consumer_cfg
             .set("group.id", consumer_group)
             .set("bootstrap.servers", brokers.join(","))
-            .set("session.timeout.ms", "5000")
+            .set("session.timeout.ms", "6000")
             .set("enable.partition.eof", "false")
             .set("enable.auto.commit", "false")
+            .set("enable.auto.offset.store", "false")
+            .set("auto.offset.reset", "beginning") // TODO should be customizable
             // .set("queued.max.messages.kbytes ", todo!()) // TODO: guess this defines how many BorrowedMessages we can store at the same time?
             .set_log_level(RDKafkaLogLevel::Debug);
         info!(config = format!("{:?}", consumer_cfg), "consumer");
-        let (commit_cb_tx, commit_cb_rx) = mpsc::channel(1);
-        let consumer: StreamConsumer<CustomContext> = StreamConsumer::from_config_and_context(
-            &consumer_cfg,
-            CustomContext {
-                commit_cb: commit_cb_tx,
-            },
-        )
-        .context("creating new consumer")?;
+        let consumer: StreamConsumer<CustomContext> =
+            StreamConsumer::from_config_and_context(&consumer_cfg, CustomContext {})
+                .context("creating new consumer")?;
         let (acks_tx, acks_rx) = mpsc::channel(16);
         let (releases_tx, releases_rx) = mpsc::channel(16);
         let (claims_tx, claims_rx) = mpsc::channel(16);
@@ -144,7 +141,7 @@ impl BatchedConsumer {
             .subscribe(&[topic])
             .context("subscribing to topic")?;
         let dispatcher = ConsumerDispatcher {
-            consumer,
+            consumer: Arc::new(consumer),
             topic: topic.to_string(),
             message_buffer: Vec::with_capacity(cfg.buffer_size),
             acks: 0,
@@ -153,7 +150,6 @@ impl BatchedConsumer {
             msg_acks: acks_rx,
             msg_releases: releases_rx,
             msg_claims: claims_rx,
-            commit_cb: commit_cb_rx,
         };
         let handle = tokio::spawn(dispatcher.run()).abort_handle();
 
@@ -167,7 +163,9 @@ impl BatchedConsumer {
 
     pub(crate) async fn claim_message(&self) -> Result<MessageWithMeta> {
         let (msg_tx, msg_rx) = oneshot::channel();
+        debug!("sending claim");
         self.claims.send(msg_tx).await.context("consumer closed")?;
+        debug!("claim sent");
 
         Ok(msg_rx.await.context("claiming message from consumer")?)
     }
@@ -190,7 +188,7 @@ impl Drop for BatchedConsumer {
 struct ConsumerDispatcher {
     cfg: ConsumerConfig,
     topic: String,
-    consumer: StreamConsumer<CustomContext>,
+    consumer: Arc<StreamConsumer<CustomContext>>,
     message_buffer: Vec<MessageWithMeta>,
     next_message: Option<MessageWithMeta>, // message to be sent to next consumer
     acks: usize,                           // number of ACKed messages in buffer
@@ -198,7 +196,6 @@ struct ConsumerDispatcher {
     msg_acks: mpsc::Receiver<usize>, // channel for ACKing message in buffers indexed by value
     msg_releases: mpsc::Receiver<usize>, // channel for releasing claimed messages
     msg_claims: mpsc::Receiver<oneshot::Sender<MessageWithMeta>>, // channel for requesting message claims
-    commit_cb: mpsc::Receiver<KafkaResult<()>>,                   // channel for commit results
 }
 
 impl ConsumerDispatcher {
@@ -214,7 +211,7 @@ impl ConsumerDispatcher {
     async fn process_events(&mut self) {
         select! {
             msg = self.consumer.recv(), if self.message_buffer.len() < self.cfg.buffer_size => {
-                debug!("got message");
+                debug!(buffer_len = self.message_buffer.len(), "got message");
                 //new message from kafka, add to batch
                 // NB: consumer.recv() is supposed to be cancellation-safe
                 // NB: this implementation seem to be less efficient that it could have been:
@@ -250,7 +247,6 @@ impl ConsumerDispatcher {
                 self.message_buffer[idx].claim_expire = None;
             }
             _ = tokio::time::sleep(DISPATCHER_TIMEOUT) => {
-                debug!("timeout!");
                 // periodically check for new messages, some may have timed out claims
             }
         };
@@ -264,6 +260,7 @@ impl ConsumerDispatcher {
         for msg in &self.message_buffer {
             if !msg.acked && msg.claim_expire.map_or(true, |v| v < Instant::now()) {
                 self.next_message = Some(msg.clone());
+                return;
             }
         }
         self.next_message = None
@@ -271,24 +268,36 @@ impl ConsumerDispatcher {
 
     async fn commit_if_needed(&mut self) {
         // TODO: partial commit on exit
-        if self.acks == 0 || self.acks < self.message_buffer.len() {
+        if self.acks < self.cfg.buffer_size {
             return;
         }
 
         let mut tpl = HashMap::new();
         for msg in &self.message_buffer {
+            let offset_to_commit = msg.offset + 1; // we committing offset of next message
             match tpl.get_mut(&msg.partition) {
                 Some(Offset::Offset(v)) => {
-                    if *v < msg.offset {
-                        *v = msg.offset;
+                    if *v < offset_to_commit {
+                        *v = offset_to_commit;
                     }
                 }
                 Some(_) => {
                     panic!("unexpected offset in TopicPartitionList")
                 }
                 None => {
-                    tpl.insert(msg.partition, Offset::from_raw(msg.offset));
+                    tpl.insert(msg.partition, Offset::from_raw(offset_to_commit));
                 }
+            }
+        }
+
+        for (partition, offset) in &tpl {
+            if let Err(e) = self
+                .consumer
+                .store_offset(&self.topic, *partition, offset.to_raw().unwrap())
+                .context("storing offset")
+            {
+                error!("storing offset for commit: {e}");
+                return;
             }
         }
 
@@ -303,25 +312,29 @@ impl ConsumerDispatcher {
             return;
         }
 
-        debug!(partition_count = tpl.count(), "committing offsets");
-        if let Err(e) = self
-            .consumer
-            .commit(&tpl, rdkafka::consumer::CommitMode::Async)
-        {
-            error!("starting batch commit: {e}");
-        }
-        match self
-            .commit_cb
-            .recv()
-            .await
-            .expect("commit callback channel shall be open")
-        {
-            Ok(_) => {}
+        debug!(
+            partition_count = tpl.count(),
+            tpl = format!("{tpl:?}"),
+            "committing offsets"
+        );
+
+        // rdkafka is awful garbage, seems like commit API does not support async operations,
+        // so we have to do commit synchronously.
+        let consumer = self.consumer.clone();
+        let commit_task = tokio::task::spawn_blocking(move || {
+            consumer.commit(&tpl, rdkafka::consumer::CommitMode::Sync)
+        });
+        match commit_task.await {
             Err(e) => {
-                // we will keep retrying
-                error!("committing batch to kafka: {e}");
+                error!("starting batch commit: {e}");
+                return;
+            }
+            Ok(_) => {
+                debug!("committed batch");
             }
         }
+        self.message_buffer.truncate(0);
+        self.acks = 0;
     }
 }
 
@@ -371,9 +384,7 @@ impl MessageWithMeta {
     }
 }
 
-struct CustomContext {
-    commit_cb: mpsc::Sender<KafkaResult<()>>,
-}
+struct CustomContext;
 
 impl ClientContext for CustomContext {}
 impl ConsumerContext for CustomContext {
@@ -387,6 +398,5 @@ impl ConsumerContext for CustomContext {
 
     fn commit_callback(&self, result: KafkaResult<()>, _offsets: &TopicPartitionList) {
         info!("Committing offsets: {:?}", result);
-        let _ = self.commit_cb.blocking_send(result);
     }
 }
